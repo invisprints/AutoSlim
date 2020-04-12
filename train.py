@@ -9,6 +9,7 @@ from torch import multiprocessing
 from torchvision import datasets, transforms
 from torch.utils.data.distributed import DistributedSampler
 import numpy as np
+from tqdm import tqdm
 
 from utils.model_profiling import model_profiling
 from utils.transforms import Lighting
@@ -397,7 +398,7 @@ def forward_loss(
 
 def run_one_epoch(
         epoch, loader, model, criterion, optimizer, meters, phase='train',
-        soft_criterion=None):
+        soft_criterion=None, writer=None):
     """run one epoch for train/val/test/cal"""
     t_start = time.time()
     assert phase in ['train', 'val', 'test', 'cal'], 'Invalid phase.'
@@ -418,7 +419,7 @@ def run_one_epoch(
 
     if getattr(FLAGS, 'distributed', False):
         loader.sampler.set_epoch(epoch)
-    for batch_idx, (input, target) in enumerate(loader):
+    for batch_idx, (input, target) in enumerate(tqdm(loader)):
         if phase == 'cal':
             if batch_idx == getattr(FLAGS, 'bn_cal_batch_num', -1):
                 break
@@ -495,7 +496,7 @@ def run_one_epoch(
                                 loss = forward_loss(
                                     model, criterion, input, target, meter)
                         loss.backward()
-            else:
+            else: # naive training
                 loss = forward_loss(
                     model, criterion, input, target, meters)
                 loss.backward()
@@ -511,7 +512,7 @@ def run_one_epoch(
                 meters['lr'].cache(optimizer.param_groups[0]['lr'])
             else:
                 pass
-        else:
+        else: #val
             if getattr(FLAGS, 'slimmable_training', False):
                 for width_mult in sorted(FLAGS.width_mult_list, reverse=True):
                     model.apply(
@@ -530,6 +531,15 @@ def run_one_epoch(
                 time.time() - t_start, phase, str(width_mult), epoch,
                 FLAGS.num_epochs) + ', '.join(
                     '{}: {:.3f}'.format(k, v) for k, v in results.items()))
+            if writer:
+                writer.add_scalars('{} err'.format(phase),
+                                   {str(width_mult): results['top1_error']},
+                                  epoch)
+                writer.add_scalars('{} loss'.format(phase),
+                                   {str(width_mult): results['loss']},
+                                   epoch)
+                if phase == 'train':
+                    writer.add_scalar('lr', results['lr'], epoch)
     elif is_master():
         results = flush_scalar_meters(meters)
         print(
@@ -619,6 +629,7 @@ def train_val_test():
         FLAGS.width_mult_list = FLAGS.width_mult_range
 
     # model
+    # model_wrapper contain data parallel & cuda
     model, model_wrapper = get_model()
     if getattr(FLAGS, 'label_smoothing', 0):
         criterion = CrossEntropyLossSmooth(reduction='none')
@@ -678,7 +689,7 @@ def train_val_test():
                 profiling(model, use_cuda=False)
             if getattr(FLAGS, 'profiling_only', False):
                 return
-
+    print('loading data!')
     # data
     train_transforms, val_transforms, test_transforms = data_transforms()
     train_set, val_set, test_set = dataset(
@@ -712,12 +723,22 @@ def train_val_test():
     if getattr(FLAGS, 'nonuniform_diff_seed', False):
         set_random_seed(getattr(FLAGS, 'random_seed', 0) + get_rank())
     print('Start training.')
+
+    if getattr(FLAGS,'SummaryWriter', False):
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter('runs/slimmable_training')
+        print("TensorBoard start!")
+    else:
+        print("TensorBoard close")
+        writer=None
+
     for epoch in range(last_epoch+1, FLAGS.num_epochs):
-        lr_scheduler.step()
         # train
         results = run_one_epoch(
             epoch, train_loader, model_wrapper, criterion, optimizer,
-            train_meters, phase='train', soft_criterion=soft_criterion)
+            train_meters, phase='train', soft_criterion=soft_criterion, writer=writer)
+
+        lr_scheduler.step()
 
         # val
         if val_meters is not None:
@@ -725,7 +746,9 @@ def train_val_test():
         with torch.no_grad():
             results = run_one_epoch(
                 epoch, val_loader, model_wrapper, criterion, optimizer,
-                val_meters, phase='val')
+                val_meters, phase='val', writer=writer)
+        if not os.path.exists(FLAGS.log_dir):
+            os.makedirs(FLAGS.log_dir)
         if is_master() and results['top1_error'] < best_val:
             best_val = results['top1_error']
             torch.save(
@@ -789,6 +812,7 @@ def init_multiprocessing():
 def main():
     """train and eval model"""
     init_multiprocessing()
+    print(FLAGS)
     train_val_test()
 
 
