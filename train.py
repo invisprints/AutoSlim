@@ -772,7 +772,7 @@ def train_val_test():
     if getattr(FLAGS, 'calibrate_bn', False):
         if getattr(FLAGS, 'universally_slimmable_training', False):
             # need to rebuild model according to width_mult_list_test
-            width_mult_list = FLAGS.width_mult_range.copy()
+            width_mult_list = FLAGS.width_mult_list.copy()
             for width in FLAGS.width_mult_list_test:
                 if width not in FLAGS.width_mult_list:
                     width_mult_list.append(width)
