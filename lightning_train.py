@@ -460,7 +460,8 @@ def main():
     trainer = pl.Trainer(gpus=FLAGS.num_gpus_per_job,
                          benchmark=True,
                          # fast_dev_run=True,
-                         max_epochs=FLAGS.num_epochs)
+                         max_epochs=FLAGS.num_epochs,
+                         profiler=True)
     trainer.fit(slim_model)
 
 
