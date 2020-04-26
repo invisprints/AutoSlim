@@ -14,25 +14,9 @@ from utils.transforms import Lighting
 from utils.distributed import init_dist, master_only, is_master
 from utils.distributed import get_rank, get_world_size
 from utils.distributed import master_only_print as print
-from utils.distributed import AllReduceDistributedDataParallel, allreduce_grads
 from utils.loss_ops import CrossEntropyLossSoft, CrossEntropyLossSmooth
 from utils.config import FLAGS
 
-def get_model():
-    """get model"""
-    model_lib = importlib.import_module(FLAGS.model)
-    model = model_lib.Model(FLAGS.num_classes, input_size=FLAGS.image_size)
-    if getattr(FLAGS, 'distributed', False):
-        gpu_id = init_dist()
-        if getattr(FLAGS, 'distributed_all_reduce', False):
-            # seems faster
-            model_wrapper = AllReduceDistributedDataParallel(model.cuda())
-        else:
-            model_wrapper = torch.nn.parallel.DistributedDataParallel(
-                model.cuda(), [gpu_id], gpu_id)
-    else:
-        model_wrapper = torch.nn.DataParallel(model).cuda()
-    return model, model_wrapper
 
 def data_transforms():
     """get transform of dataset"""
@@ -174,23 +158,25 @@ def data_loader(train_set, val_set, test_set):
         FLAGS.batch_size = FLAGS.batch_size_per_gpu * FLAGS.num_gpus_per_job
     else:
         raise ValueError('batch size (per gpu) is not defined')
-    batch_size = int(FLAGS.batch_size/get_world_size())
+    # batch_size = int(FLAGS.batch_size/get_world_size())
+    batch_size = int(FLAGS.batch_size)
     if FLAGS.data_loader == 'imagenet1k_basic':
-        if getattr(FLAGS, 'distributed', False):
-            if FLAGS.test_only:
-                train_sampler = None
-            else:
-                train_sampler = DistributedSampler(train_set)
-            val_sampler = DistributedSampler(val_set)
-        else:
-            train_sampler = None
-            val_sampler = None
+        # if getattr(FLAGS, 'distributed', False):
+        #     if FLAGS.test_only:
+        #         train_sampler = None
+        #     else:
+        #         train_sampler = DistributedSampler(train_set)
+        #     val_sampler = DistributedSampler(val_set)
+        # else:
+        #     train_sampler = None
+        #     val_sampler = None
         if not FLAGS.test_only:
             train_loader = torch.utils.data.DataLoader(
                 train_set,
                 batch_size=batch_size,
-                shuffle=(train_sampler is None),
-                sampler=train_sampler,
+                # shuffle=(train_sampler is None),
+                shuffle=True,
+                # sampler=train_sampler,
                 pin_memory=True,
                 num_workers=FLAGS.data_loader_workers,
                 drop_last=getattr(FLAGS, 'drop_last', False))
@@ -198,7 +184,7 @@ def data_loader(train_set, val_set, test_set):
             val_set,
             batch_size=batch_size,
             shuffle=False,
-            sampler=val_sampler,
+            # sampler=val_sampler,
             pin_memory=True,
             num_workers=FLAGS.data_loader_workers,
             drop_last=getattr(FLAGS, 'drop_last', False))
@@ -291,7 +277,7 @@ class slimmNetWork(pl.LightningModule):
                 self.model.apply(
                     lambda m: setattr(m, 'width_mult', width_mult))
                 y_hat = self(x)
-                loss = self.criterion(y_hat, y)
+                loss = torch.mean(self.criterion(y_hat, y))
                 loss.backward()
                 logs[str(width_mult)] = loss
                 if width_mult == self.max_width:
@@ -312,7 +298,7 @@ class slimmNetWork(pl.LightningModule):
                 self.model.apply(
                     lambda m: setattr(m, 'width_mult', width_mult))
                 y_hat = self(x)
-                loss = self.criterion(y_hat, y)
+                loss = torch.mean(self.criterion(y_hat, y))
                 logs[str(width_mult)] = loss
         return logs
 
@@ -321,7 +307,7 @@ class slimmNetWork(pl.LightningModule):
         avg_loss = {}
         for width_mult in sorted(FLAGS.width_mult_list):
             avg_loss[str(width_mult)] = torch.stack([x[str(width_mult)] for x in outputs]).mean()
-        return {'avg_val_loss': avg_loss, 'log': avg_loss}
+        return {'val_loss': avg_loss, 'log': avg_loss}
 
     def test_step(self, batch, batch_nb):
         # OPTIONAL
@@ -332,7 +318,7 @@ class slimmNetWork(pl.LightningModule):
                 self.model.apply(
                     lambda m: setattr(m, 'width_mult', width_mult))
                 y_hat = self(x)
-                loss = self.criterion(y_hat, y)
+                loss = torch.mean(self.criterion(y_hat, y))
                 logs[str(width_mult)] = loss
         return logs
 
@@ -374,49 +360,49 @@ class slimmNetWork(pl.LightningModule):
                 raise NotImplementedError(
                     'Optimizer {} is not yet implemented.'.format(FLAGS.optimizer))
 
-            # lr scheduler
-            warmup_epochs = getattr(FLAGS, 'lr_warmup_epochs', 0)
-            if FLAGS.lr_scheduler == 'multistep':
-                lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
-                    optimizer, milestones=FLAGS.multistep_lr_milestones,
-                    gamma=FLAGS.multistep_lr_gamma)
-            elif FLAGS.lr_scheduler == 'exp_decaying':
-                lr_dict = {}
-                for i in range(FLAGS.num_epochs):
-                    if i == 0:
-                        lr_dict[i] = 1
-                    else:
-                        lr_dict[i] = lr_dict[i-1] * FLAGS.exp_decaying_lr_gamma
-                lr_lambda = lambda epoch: lr_dict[epoch]
-                lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-                    optimizer, lr_lambda=lr_lambda)
-            elif FLAGS.lr_scheduler == 'linear_decaying':
-                num_epochs = FLAGS.num_epochs - warmup_epochs
-                lr_dict = {}
-                for i in range(FLAGS.num_epochs):
-                    lr_dict[i] = 1. - (i - warmup_epochs) / num_epochs
-                lr_lambda = lambda epoch: lr_dict[epoch]
-                lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-                    optimizer, lr_lambda=lr_lambda)
-            elif FLAGS.lr_scheduler == 'cosine_decaying':
-                num_epochs = FLAGS.num_epochs - warmup_epochs
-                lr_dict = {}
-                for i in range(FLAGS.num_epochs):
-                    lr_dict[i] = (
-                                         1. + math.cos(
-                                     math.pi * (i - warmup_epochs) / num_epochs)) / 2.
-                lr_lambda = lambda epoch: lr_dict[epoch]
-                lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-                    optimizer, lr_lambda=lr_lambda)
-            else:
-                try:
-                    lr_scheduler_lib = importlib.import_module(FLAGS.lr_scheduler)
-                    lr_scheduler = lr_scheduler_lib.get_lr_scheduler(optimizer)
-                except ImportError:
-                    raise NotImplementedError(
-                        'Learning rate scheduler {} is not yet implemented.'.format(
+        # lr scheduler
+        warmup_epochs = getattr(FLAGS, 'lr_warmup_epochs', 0)
+        if FLAGS.lr_scheduler == 'multistep':
+            lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                optimizer, milestones=FLAGS.multistep_lr_milestones,
+                gamma=FLAGS.multistep_lr_gamma)
+        elif FLAGS.lr_scheduler == 'exp_decaying':
+            lr_dict = {}
+            for i in range(FLAGS.num_epochs):
+                if i == 0:
+                    lr_dict[i] = 1
+                else:
+                    lr_dict[i] = lr_dict[i-1] * FLAGS.exp_decaying_lr_gamma
+            lr_lambda = lambda epoch: lr_dict[epoch]
+            lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=lr_lambda)
+        elif FLAGS.lr_scheduler == 'linear_decaying':
+            num_epochs = FLAGS.num_epochs - warmup_epochs
+            lr_dict = {}
+            for i in range(FLAGS.num_epochs):
+                lr_dict[i] = 1. - (i - warmup_epochs) / num_epochs
+            lr_lambda = lambda epoch: lr_dict[epoch]
+            lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=lr_lambda)
+        elif FLAGS.lr_scheduler == 'cosine_decaying':
+            num_epochs = FLAGS.num_epochs - warmup_epochs
+            lr_dict = {}
+            for i in range(FLAGS.num_epochs):
+                lr_dict[i] = (
+                                     1. + math.cos(
+                                 math.pi * (i - warmup_epochs) / num_epochs)) / 2.
+            lr_lambda = lambda epoch: lr_dict[epoch]
+            lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=lr_lambda)
+        else:
+            try:
+                lr_scheduler_lib = importlib.import_module(FLAGS.lr_scheduler)
+                lr_scheduler = lr_scheduler_lib.get_lr_scheduler(optimizer)
+            except ImportError:
+                raise NotImplementedError(
+                    'Learning rate scheduler {} is not yet implemented.'.format(
                             FLAGS.lr_scheduler))
-        self.last_epoch = lr_scheduler.last_epoch
+        # self.last_epoch = lr_scheduler.last_epoch
         return [optimizer], [lr_scheduler]
 
     def train_dataloader(self):
@@ -471,7 +457,10 @@ def main():
     slim_model = slimmNetWork(FLAGS)
 
     # most basic trainer, uses good defaults (1 gpu)
-    trainer = pl.Trainer(gpus=FLAGS.num_gpus_per_job)
+    trainer = pl.Trainer(gpus=FLAGS.num_gpus_per_job,
+                         benchmark=True,
+                         # fast_dev_run=True,
+                         max_epochs=FLAGS.num_epochs)
     trainer.fit(slim_model)
 
 
